@@ -1,115 +1,68 @@
 const { WebSocketServer } = require('ws');
 const mongoose = require('mongoose');
 
-// 1. ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ
+// 1. ПОДКЛЮЧЕНИЕ К БАЗЕ
 const MONGODB_URI = 'mongodb+srv://Milkissur0:Dolocat228@cluster0.veutlub.mongodb.net/myChat?retryWrites=true&w=majority';
+mongoose.connect(MONGODB_URI).then(() => console.log('База данных подключена! 🏦'));
 
-mongoose.connect(MONGODB_URI)
-    .then(() => console.log('База данных MongoDB подключена! 🏦'))
-    .catch(err => console.error('Ошибка базы:', err));
-
-// Схема сообщения для базы данных
+// Схема с полем для галочек (isRead)
 const Message = mongoose.model('Message', new mongoose.Schema({
-    from: String,
-    to: { type: String, default: 'all' },
-    text: String,
-    time: String,
-    type: { type: String, default: 'group' }
+    from: String, to: String, text: String, time: String, 
+    type: String, isRead: { type: Boolean, default: false }
 }));
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
+const users = new Map(); // "ник": сокет
 
-// Хранилище активных пользователей: { "ник": сокет }
-const users = new Map();
-
-// Функция для рассылки списка всех, кто в сети
 function broadcastOnlineList() {
-    const onlineList = JSON.stringify({
-        type: 'online_list',
-        users: Array.from(users.keys())
-    });
-    wss.clients.forEach(client => {
-        if (client.readyState === 1) client.send(onlineList);
-    });
+    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(list); });
 }
 
 wss.on('connection', async (ws) => {
-    let userNick = "";
-    console.log('Новое подключение! 📱');
+    let myName = "";
 
     ws.on('message', async (data) => {
         try {
             const msg = JSON.parse(data.toString());
             const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
-            // --- 1. РЕГИСТРАЦИЯ / АВТОРИЗАЦИЯ ---
+            // --- АВТОРИЗАЦИЯ ---
             if (msg.type === 'auth') {
-                // Если юзер сменил ник, удаляем старый из списка
-                if (userNick && users.has(userNick)) {
-                    users.delete(userNick);
-                }
-                
-                userNick = msg.from;
-                users.set(userNick, ws);
-                console.log(`Пользователь ${userNick} теперь в сети!`);
-                
-                // Рассылаем всем обновленный список онлайн-юзеров
+                myName = msg.from;
+                users.set(myName, ws);
                 broadcastOnlineList();
-
-                // Загружаем историю (общую и личную для этого юзера)
-                const history = await Message.find({ 
-                    $or: [{ to: 'all' }, { to: userNick }, { from: userNick }] 
-                }).sort({ _id: 1 }).limit(100);
                 
-                history.forEach(m => {
-                    const historyMsg = m.toObject();
-                    historyMsg.type = m.type; // Убеждаемся, что тип передается
-                    ws.send(JSON.stringify(historyMsg));
-                });
+                // Загружаем ВСЮ историю этого пользователя
+                const history = await Message.find({ 
+                    $or: [{ to: 'all' }, { to: myName }, { from: myName }] 
+                }).sort({ _id: 1 });
+                history.forEach(m => ws.send(JSON.stringify(m)));
                 return;
             }
 
-            // --- 2. ОБРАБОТКА И СОХРАНЕНИЕ СООБЩЕНИЙ ---
-            const newMessage = new Message({
-                from: msg.from,
-                to: msg.to || 'all',
-                text: msg.text,
-                time: time,
-                type: msg.type || 'group'
-            });
-            await newMessage.save();
-
-            const dataToSend = JSON.stringify(newMessage);
-
-            if (msg.type === 'private') {
-                // Личное сообщение: шлем только получателю и себе
-                const targetSocket = users.get(msg.to);
-                if (targetSocket && targetSocket.readyState === 1) {
-                    targetSocket.send(dataToSend);
-                }
-                ws.send(dataToSend); // Отправляем автору, чтобы отобразилось в чате
-            } else {
-                // Групповое сообщение: шлем всем
-                wss.clients.forEach(client => {
-                    if (client.readyState === 1) client.send(dataToSend);
-                });
+            // --- ГАЛОЧКИ (Прочитано) ---
+            if (msg.type === 'read_receipt') {
+                await Message.updateMany({ from: msg.from, to: msg.to, isRead: false }, { $set: { isRead: true } });
+                const senderSocket = users.get(msg.from);
+                if (senderSocket) senderSocket.send(JSON.stringify({ type: 'read_update', partner: msg.to }));
+                return;
             }
 
-        } catch (e) {
-            console.log('Ошибка обработки сообщения:', e.message);
-        }
+            // --- ОТПРАВКА СООБЩЕНИЯ ---
+            const newMessage = new Message({ ...msg, time, isRead: false });
+            await newMessage.save();
+
+            const response = JSON.stringify(newMessage);
+            if (msg.type === 'private') {
+                const friend = users.get(msg.to);
+                if (friend) friend.send(response);
+                ws.send(response); // Себе
+            } else {
+                wss.clients.forEach(c => { if (c.readyState === 1) c.send(response); });
+            }
+        } catch (e) { console.log("Ошибка:", e.message); }
     });
 
-    // Когда кто-то отключается
-    ws.on('close', () => {
-        if (userNick) {
-            console.log(`${userNick} вышел из сети.`);
-            users.delete(userNick);
-            broadcastOnlineList(); // Обновляем список у всех остальных
-        }
-    });
-
-    ws.on('error', (err) => console.log('Ошибка сокета:', err));
+    ws.on('close', () => { if (myName) { users.delete(myName); broadcastOnlineList(); } });
 });
-
-console.log('Сервер мессенджера с поддержкой вкладок и БД запущен!');
