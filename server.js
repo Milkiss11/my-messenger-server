@@ -1,45 +1,62 @@
 const { WebSocketServer } = require('ws');
-const fs = require('fs');
+const mongoose = require('mongoose');
 
-// Используем порт от Render или 8080 для локальных тестов
+// 1. ПОДКЛЮЧЕНИЕ К ТВОЕЙ БАЗЕ MONGODB
+const MONGODB_URI = 'mongodb+srv://Milkissur0:Dolocat228@cluster0.veutlub.mongodb.net/myChat?retryWrites=true&w=majority';
+
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log('База данных MongoDB подключена! 🏦'))
+    .catch(err => console.error('Ошибка базы:', err));
+
+// Схема сообщения (кто, кому, что, когда)
+const MessageSchema = new mongoose.Schema({
+    from: String,
+    to: { type: String, default: 'all' }, 
+    text: String,
+    time: String
+});
+const Message = mongoose.model('Message', MessageSchema);
+
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const HISTORY_FILE = 'chat_history.txt';
 
-// Функция загрузки истории
-function loadHistory() {
-    if (fs.existsSync(HISTORY_FILE)) {
-        return fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(line => line.length > 0);
-    }
-    return [];
-}
-
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
     console.log('Новое подключение! 📱');
 
-    // 1. Отправляем историю новому пользователю
-    const history = loadHistory();
-    history.forEach(msg => ws.send(msg));
-
-    // 2. Обработка новых сообщений
-    ws.on('message', (data) => {
-        // Добавляем время сервера (МСК/Локальное)
-        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        const messageWithTime = `[${time}] ${data.toString()}`;
-        
-        console.log('Получено:', messageWithTime);
-
-        // Сохраняем в файл
-        fs.appendFileSync(HISTORY_FILE, messageWithTime + '\n');
-
-        // Рассылаем ВСЕМ активным пользователям
-        wss.clients.forEach(client => {
-            if (client.readyState === 1) {
-                client.send(messageWithTime);
-            }
+    // 2. ЗАГРУЗКА ПОСЛЕДНИХ 50 СООБЩЕНИЙ ИЗ БАЗЫ
+    try {
+        const history = await Message.find({ to: 'all' }).sort({ _id: 1 }).limit(50);
+        history.forEach(msg => {
+            ws.send(`[${msg.time}] [${msg.from}]: ${msg.text}`);
         });
-    });
+    } catch (e) { console.log('Ошибка загрузки истории:', e); }
 
-    ws.on('error', (err) => console.log('Ошибка сокета:', err));
+    ws.on('message', async (data) => {
+        const rawData = data.toString();
+        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+        // Парсим ник и текст: [ник]: текст
+        const match = rawData.match(/\[(.*?)\]: (.*)/);
+        if (match) {
+            const userName = match[1];
+            const messageText = match[2];
+
+            // 3. СОХРАНЯЕМ В БАЗУ
+            try {
+                const newMessage = new Message({
+                    from: userName,
+                    text: messageText,
+                    time: time
+                });
+                await newMessage.save();
+            } catch (e) { console.log('Ошибка сохранения:', e); }
+
+            // Рассылаем всем
+            const fullMsg = `[${time}] [${userName}]: ${messageText}`;
+            wss.clients.forEach(client => {
+                if (client.readyState === 1) client.send(fullMsg);
+            });
+        }
+    });
 });
 
-console.log('Сервер запущен и готов к работе!');
+console.log('Сервер с вечной памятью запущен!');
