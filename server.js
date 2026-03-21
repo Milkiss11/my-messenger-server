@@ -1,68 +1,59 @@
 const { WebSocketServer } = require('ws');
-const mongoose = require('mongoose');
-
-// 1. ПОДКЛЮЧЕНИЕ К БАЗЕ
-const MONGODB_URI = 'mongodb+srv://Milkissur0:Dolocat228@cluster0.veutlub.mongodb.net/myChat?retryWrites=true&w=majority';
-mongoose.connect(MONGODB_URI).then(() => console.log('База данных подключена! 🏦'));
-
-// Схема с полем для галочек (isRead)
-const Message = mongoose.model('Message', new mongoose.Schema({
-    from: String, to: String, text: String, time: String, 
-    type: String, isRead: { type: Boolean, default: false }
-}));
+const fs = require('fs');
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const users = new Map(); // "ник": сокет
+const HISTORY_FILE = 'chat_history.txt';
 
-function broadcastOnlineList() {
-    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
-    wss.clients.forEach(c => { if (c.readyState === 1) c.send(list); });
+function loadHistory() {
+    if (fs.existsSync(HISTORY_FILE)) {
+        return fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(line => line.length > 0);
+    }
+    return [];
 }
 
-wss.on('connection', async (ws) => {
-    let myName = "";
+wss.on('connection', (ws) => {
+    console.log('Новое подключение! 📱');
+    ws.isAlive = true;
 
-    ws.on('message', async (data) => {
-        try {
-            const msg = JSON.parse(data.toString());
-            const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    // Сразу отправляем историю
+    const history = loadHistory();
+    history.forEach(msg => ws.send(msg));
 
-            // --- АВТОРИЗАЦИЯ ---
-            if (msg.type === 'auth') {
-                myName = msg.from;
-                users.set(myName, ws);
-                broadcastOnlineList();
-                
-                // Загружаем ВСЮ историю этого пользователя
-                const history = await Message.find({ 
-                    $or: [{ to: 'all' }, { to: myName }, { from: myName }] 
-                }).sort({ _id: 1 });
-                history.forEach(m => ws.send(JSON.stringify(m)));
-                return;
-            }
+    ws.on('message', (data) => {
+        const message = data.toString();
+        
+        // Ответ на пинг от телефона (если добавишь в Android)
+        if (message === 'pong') {
+            ws.isAlive = true;
+            return;
+        }
 
-            // --- ГАЛОЧКИ (Прочитано) ---
-            if (msg.type === 'read_receipt') {
-                await Message.updateMany({ from: msg.from, to: msg.to, isRead: false }, { $set: { isRead: true } });
-                const senderSocket = users.get(msg.from);
-                if (senderSocket) senderSocket.send(JSON.stringify({ type: 'read_update', partner: msg.to }));
-                return;
-            }
+        // Если пришло обычное сообщение
+        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        // Проверяем, нет ли уже времени в начале (чтобы не дублировать при пересылке)
+        const finalMsg = message.startsWith('[') ? message : `[${time}] ${message}`;
+        
+        console.log('Получено:', finalMsg);
+        fs.appendFileSync(HISTORY_FILE, finalMsg + '\n');
 
-            // --- ОТПРАВКА СООБЩЕНИЯ ---
-            const newMessage = new Message({ ...msg, time, isRead: false });
-            await newMessage.save();
-
-            const response = JSON.stringify(newMessage);
-            if (msg.type === 'private') {
-                const friend = users.get(msg.to);
-                if (friend) friend.send(response);
-                ws.send(response); // Себе
-            } else {
-                wss.clients.forEach(c => { if (c.readyState === 1) c.send(response); });
-            }
-        } catch (e) { console.log("Ошибка:", e.message); }
+        wss.clients.forEach(client => {
+            if (client.readyState === 1) client.send(finalMsg);
+        });
     });
 
-    ws.on('close', () => { if (myName) { users.delete(myName); broadcastOnlineList(); } });
+    ws.on('pong', () => { ws.isAlive = true; }); // Стандартный обработчик понга
 });
+
+// ПРОВЕРКА СВЯЗИ КАЖДЫЕ 10 СЕКУНД
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        
+        ws.isAlive = false;
+        ws.send('ping'); // Посылаем сигнал жизни
+    });
+}, 10000); // 10000 мс = 10 сек
+
+wss.on('close', () => clearInterval(interval));
+
+console.log('Сервер с быстрым пингом (10с) запущен!');
