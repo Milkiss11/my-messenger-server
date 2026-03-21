@@ -1,11 +1,11 @@
 const { WebSocketServer } = require('ws');
-const fs = require('fs'); // Модуль для работы с файлами
+const fs = require('fs');
 
+// Используем порт от Render или 8080 для локальных тестов
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-
 const HISTORY_FILE = 'chat_history.txt';
 
-// Функция для загрузки истории из файла
+// Функция загрузки истории
 function loadHistory() {
     if (fs.existsSync(HISTORY_FILE)) {
         return fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(line => line.length > 0);
@@ -16,24 +16,30 @@ function loadHistory() {
 wss.on('connection', (ws) => {
     console.log('Новое подключение! 📱');
 
-    // 1. Сразу отправляем новичку всю историю сообщений
+    // 1. Отправляем историю новому пользователю
     const history = loadHistory();
     history.forEach(msg => ws.send(msg));
 
+    // 2. Обработка новых сообщений
     ws.on('message', (data) => {
-        const message = data.toString();
-        console.log('Получено:', message);
+        // Добавляем время сервера (МСК/Локальное)
+        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        const messageWithTime = `[${time}] ${data.toString()}`;
+        
+        console.log('Получено:', messageWithTime);
 
-        // 2. Сохраняем новое сообщение в файл (дописываем в конец)
-        fs.appendFileSync(HISTORY_FILE, message + '\n');
+        // Сохраняем в файл
+        fs.appendFileSync(HISTORY_FILE, messageWithTime + '\n');
 
-        // 3. Рассылаем всем в сети
+        // Рассылаем ВСЕМ активным пользователям
         wss.clients.forEach(client => {
             if (client.readyState === 1) {
-                client.send(message);
+                client.send(messageWithTime);
             }
         });
     });
+
+    ws.on('error', (err) => console.log('Ошибка сокета:', err));
 });
 
-console.log('Сервер с памятью запущен на ws://localhost:8080');
+console.log('Сервер запущен и готов к работе!');
