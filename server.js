@@ -1,7 +1,8 @@
 const { WebSocketServer } = require('ws');
 const fs = require('fs'); // Модуль для работы с файлами
 
-const wss = new WebSocketServer({ port: 8080 });
+const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
+
 const HISTORY_FILE = 'chat_history.txt';
 
 // Функция для загрузки истории из файла
