@@ -1,5 +1,5 @@
 const { WebSocketServer } = require('ws');
-const { MongoClient, ObjectId } = require('mongodb'); // Добавили ObjectId
+const { MongoClient, ObjectId } = require('mongodb');
 
 const uri = "mongodb+srv://Milkissur0:Dolocat228@cluster0.veutlub.mongodb.net/messenger?retryWrites=true&w=majority&appName=Cluster0";
 const client = new MongoClient(uri);
@@ -21,12 +21,15 @@ wss.on('connection', (ws) => {
     let currentUser = null;
     ws.isAlive = true;
 
+    // Обработка Pong от клиента
+    ws.on('pong', () => { ws.isAlive = true; });
+
     ws.on('message', async (data) => {
         try {
-            const msg = JSON.parse(data.toString());
-            if (msg === 'pong') { ws.isAlive = true; return; }
+            const raw = data.toString();
+            if (raw === 'pong') { ws.isAlive = true; return; }
+            const msg = JSON.parse(raw);
 
-            // 1. АВТОРИЗАЦИЯ И ИСТОРИЯ
             if (msg.type === 'auth') {
                 currentUser = msg.user;
                 users.set(currentUser, ws);
@@ -38,26 +41,21 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // 2. РЕДАКТИРОВАНИЕ
             if (msg.type === 'edit') {
-                await chatCollection.updateOne(
-                    { _id: new ObjectId(msg.id) },
-                    { $set: { text: msg.text, isEdited: true } }
-                );
-                broadcast(JSON.stringify({ ...msg, type: 'update' }));
+                await chatCollection.updateOne({ _id: new ObjectId(msg.id) }, { $set: { text: msg.text, isEdited: true } });
+                broadcast(JSON.stringify({ type: 'update', id: msg.id, text: msg.text }));
                 return;
             }
 
-            // 3. НОВОЕ СООБЩЕНИЕ (Обычное, Ответ или Пересылка)
             if (msg.type === 'group' || msg.type === 'private') {
                 const doc = { 
                     ...msg, 
-                    time: getTime(), 
+                    time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
                     timestamp: Date.now(),
                     isEdited: false 
                 };
                 const result = await chatCollection.insertOne(doc);
-                const out = JSON.stringify({ ...doc, _id: result.insertedId }); // Возвращаем с ID
+                const out = JSON.stringify({ ...doc, _id: result.insertedId.toString() });
 
                 if (msg.type === 'group') {
                     broadcast(out);
@@ -70,20 +68,30 @@ wss.on('connection', (ws) => {
         } catch (e) { console.log("Ошибка:", e); }
     });
 
-    ws.on('close', () => { if (currentUser) { users.delete(currentUser); broadcastOnlineList(); } });
+    ws.on('close', () => {
+        if (currentUser) {
+            users.delete(currentUser);
+            broadcastOnlineList();
+        }
+    });
 });
 
-function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
-function getTime() { return new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); }
+function broadcast(data) {
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); });
+}
+
 function broadcastOnlineList() {
     const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
     broadcast(list);
 }
 
+// Пинг раз в 45 секунд, чтобы Render не закрыл соединение
 setInterval(() => {
     wss.clients.forEach(ws => {
-        if (!ws.isAlive) return ws.terminate();
+        if (ws.isAlive === false) return ws.terminate();
         ws.isAlive = false;
-        ws.send('ping');
+        ws.ping(); // Используем встроенный протокольный пинг
     });
-}, 10000);
+}, 45000);
+
+console.log('Сервер запущен');
