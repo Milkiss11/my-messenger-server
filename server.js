@@ -6,11 +6,13 @@ const client = new MongoClient(uri);
 let chatCollection, accountsCollection;
 
 async function connectDB() {
-    await client.connect();
-    const db = client.db("messenger");
-    chatCollection = db.collection("messages");
-    accountsCollection = db.collection("accounts");
-    console.log("✅ MaXiM Server: OK");
+    try {
+        await client.connect();
+        const db = client.db("messenger");
+        chatCollection = db.collection("messages");
+        accountsCollection = db.collection("accounts");
+        console.log("✅ MaXiM Database Connected");
+    } catch (e) { console.error("❌ DB ERROR:", e.message); }
 }
 connectDB();
 
