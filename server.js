@@ -6,13 +6,11 @@ const client = new MongoClient(uri);
 let chatCollection, accountsCollection;
 
 async function connectDB() {
-    try {
-        await client.connect();
-        const db = client.db("messenger");
-        chatCollection = db.collection("messages");
-        accountsCollection = db.collection("accounts");
-        console.log("✅ MaXiM Server: Database Connected");
-    } catch (e) { console.error(e); }
+    await client.connect();
+    const db = client.db("messenger");
+    chatCollection = db.collection("messages");
+    accountsCollection = db.collection("accounts");
+    console.log("✅ Database Connected");
 }
 connectDB();
 
@@ -24,23 +22,16 @@ wss.on('connection', (ws) => {
     ws.on('message', async (data) => {
         try {
             const msg = JSON.parse(data.toString());
-
             if (msg.type === 'auth') {
                 const { user, tag } = msg;
                 let account = await accountsCollection.findOne({ tag: tag });
-
                 if (account) {
-                    if (account.user !== user) {
-                        const nameCheck = await accountsCollection.findOne({ user: user });
-                        if (nameCheck) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник занят!' }));
-                        await accountsCollection.updateOne({ tag: tag }, { $set: { user: user } });
-                    }
+                    if (account.user !== user) await accountsCollection.updateOne({ tag: tag }, { $set: { user: user } });
                 } else {
                     const nameCheck = await accountsCollection.findOne({ user: user });
                     if (nameCheck) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник занят!' }));
                     await accountsCollection.insertOne({ user: user, tag: tag });
                 }
-
                 currentUser = user;
                 users.set(currentUser, { ws });
                 const history = await chatCollection.find({ $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }] }).sort({ timestamp: 1 }).toArray();
@@ -48,9 +39,8 @@ wss.on('connection', (ws) => {
                 broadcastOnlineList();
                 return;
             }
-
             if (msg.type === 'group' || msg.type === 'private') {
-                const doc = { ...msg, time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }), timestamp: Date.now(), isEdited: false };
+                const doc = { ...msg, time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }), timestamp: Date.now() };
                 const res = await chatCollection.insertOne(doc);
                 const out = JSON.stringify({ ...doc, _id: res.insertedId.toString() });
                 if (msg.type === 'group') broadcast(out);
@@ -74,7 +64,5 @@ wss.on('connection', (ws) => {
 });
 
 function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
-function broadcastOnlineList() {
-    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
-    broadcast(list);
-}
+function broadcastOnlineList() { broadcast(JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) })); }
+
