@@ -1,5 +1,5 @@
 const { WebSocketServer } = require('ws');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient } = require('mongodb');
 
 const uri = "mongodb+srv://Milkissur0:Dolocat228@cluster0.veutlub.mongodb.net/messenger?retryWrites=true&w=majority&appName=Cluster0";
 const client = new MongoClient(uri);
@@ -11,13 +11,13 @@ async function connectDB() {
         const db = client.db("messenger");
         chatCollection = db.collection("messages");
         accountsCollection = db.collection("accounts");
-        console.log("✅ Сервер Nevkini: база подключена");
-    } catch (e) { console.error("❌ Ошибка базы:", e); }
+        console.log("✅ База Nevkini подключена");
+    } catch (e) { console.error("❌ Ошибка MongoDB:", e); }
 }
 connectDB();
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const users = new Map();
+const users = new Map(); // key: nick, value: { ws, avatar }
 
 wss.on('connection', (ws) => {
     let currentUser = null;
@@ -26,52 +26,72 @@ wss.on('connection', (ws) => {
 
     ws.on('message', async (data) => {
         try {
-            const raw = data.toString();
-            if (raw === 'pong') { ws.isAlive = true; return; }
-            const msg = JSON.parse(raw);
+            const msg = JSON.parse(data.toString());
 
             if (msg.type === 'auth') {
-                const { user, tag, avatar } = msg;
-                let account = await accountsCollection.findOne({ tag: tag });
-                if (account) {
-                    await accountsCollection.updateOne({ tag: tag }, { $set: { user: user, avatar: avatar } });
-                } else {
-                    const nameCheck = await accountsCollection.findOne({ user: user });
-                    if (nameCheck) { ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник занят!' })); return; }
-                    await accountsCollection.insertOne({ user: user, tag: tag, avatar: avatar });
-                }
-                currentUser = user;
-                users.set(currentUser, { ws, avatar: avatar || "" });
+                currentUser = msg.user;
+                users.set(currentUser, { ws, avatar: msg.avatar || "" });
+                
+                // Сохраняем аккаунт
+                await accountsCollection.updateOne({ tag: msg.tag }, { $set: { user: msg.user, avatar: msg.avatar } }, { upsert: true });
+
+                // Загружаем историю (общие + сообщения для/от текущего юзера)
                 const history = await chatCollection.find({
-                    $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }]
+                    $or: [
+                        { type: 'group' }, 
+                        { user: currentUser }, 
+                        { to: currentUser }
+                    ]
                 }).sort({ timestamp: 1 }).limit(100).toArray();
+                
                 ws.send(JSON.stringify({ type: 'history', data: history }));
                 broadcastOnlineList();
                 return;
             }
 
             if (msg.type === 'group' || msg.type === 'private') {
-                const session = users.get(currentUser);
                 const doc = { 
-                    ...msg, avatar: session ? session.avatar : "", 
+                    ...msg, 
                     time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
-                    timestamp: Date.now(), isEdited: false, read: false 
+                    timestamp: Date.now() 
                 };
                 const res = await chatCollection.insertOne(doc);
                 const out = JSON.stringify({ ...doc, _id: res.insertedId.toString() });
-                if (msg.type === 'group') broadcast(out);
-                else {
-                    const t = users.get(msg.to);
-                    if (t) t.ws.send(out);
-                    ws.send(out);
+
+                if (msg.type === 'group') {
+                    broadcast(out);
+                } else {
+                    // Личное сообщение (АФК логика)
+                    const target = users.get(msg.to);
+                    if (target) target.ws.send(out); // Отправляем онлайн-получателю
+                    ws.send(out); // Отправляем себе для подтверждения
                 }
             }
-            // Другие типы (delete, edit, typing, read_all) остаются без изменений...
-        } catch (e) { console.log(e); }
+        } catch (e) { console.log("WS Error:", e); }
     });
-    ws.on('close', () => { if (currentUser) { users.delete(currentUser); broadcastOnlineList(); } });
+
+    ws.on('close', () => { 
+        if (currentUser) { 
+            users.delete(currentUser); 
+            broadcastOnlineList(); 
+        } 
+    });
 });
 
-function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
-function broadcastOnlineList() { broadcast(JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) })); }
-setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 45000);
+function broadcast(data) {
+    wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); });
+}
+
+function broadcastOnlineList() {
+    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
+    broadcast(list);
+}
+
+// Пинг, чтобы Render не закрывал соединение
+setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
