@@ -6,11 +6,13 @@ const client = new MongoClient(uri);
 let chatCollection, accountsCollection;
 
 async function connectDB() {
-    await client.connect();
-    const db = client.db("messenger");
-    chatCollection = db.collection("messages");
-    accountsCollection = db.collection("accounts");
-    console.log("✅ MaXiM DB Connected");
+    try {
+        await client.connect();
+        const db = client.db("messenger");
+        chatCollection = db.collection("messages");
+        accountsCollection = db.collection("accounts");
+        console.log("✅ MaXiM Server Connected");
+    } catch (e) { console.error(e); }
 }
 connectDB();
 
@@ -19,6 +21,9 @@ const users = new Map();
 
 wss.on('connection', (ws) => {
     let currentUser = null;
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
     ws.on('message', async (data) => {
         try {
             const msg = JSON.parse(data.toString());
@@ -35,10 +40,11 @@ wss.on('connection', (ws) => {
                 currentUser = user;
                 users.set(currentUser, { ws });
                 const history = await chatCollection.find({ $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }] }).sort({ timestamp: 1 }).toArray();
-                ws.send(JSON.stringify({ type: 'history', messages: history }));
+                ws.send(JSON.stringify({ type: 'history', data: history }));
                 broadcastOnlineList();
                 return;
             }
+
             if (msg.type === 'group' || msg.type === 'private') {
                 const doc = { ...msg, time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }), timestamp: Date.now() };
                 const res = await chatCollection.insertOne(doc);
@@ -50,10 +56,24 @@ wss.on('connection', (ws) => {
                     ws.send(out);
                 }
             }
+            if (msg.type === 'delete') {
+                await chatCollection.deleteOne({ _id: new ObjectId(msg.id) });
+                broadcast(JSON.stringify({ type: 'delete', id: msg.id }));
+            }
+            if (msg.type === 'edit') {
+                await chatCollection.updateOne({ _id: new ObjectId(msg.id) }, { $set: { text: msg.text, isEdited: true } });
+                broadcast(JSON.stringify({ type: 'edit', id: msg.id, text: msg.text }));
+            }
         } catch (e) { console.log(e); }
     });
     ws.on('close', () => { if (currentUser) { users.delete(currentUser); broadcastOnlineList(); } });
 });
 
 function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
-function broadcastOnlineList() { broadcast(JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) })); }
+function broadcastOnlineList() {
+    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
+    broadcast(list);
+}
+setInterval(() => {
+    wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); });
+}, 30000);
