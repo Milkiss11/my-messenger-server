@@ -10,7 +10,7 @@ async function connectDB() {
     const db = client.db("messenger");
     chatCollection = db.collection("messages");
     accountsCollection = db.collection("accounts");
-    console.log("✅ Database Connected");
+    console.log("✅ MaXiM DB Connected");
 }
 connectDB();
 
@@ -35,7 +35,7 @@ wss.on('connection', (ws) => {
                 currentUser = user;
                 users.set(currentUser, { ws });
                 const history = await chatCollection.find({ $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }] }).sort({ timestamp: 1 }).toArray();
-                ws.send(JSON.stringify({ type: 'history', data: history }));
+                ws.send(JSON.stringify({ type: 'history', messages: history }));
                 broadcastOnlineList();
                 return;
             }
@@ -50,14 +50,6 @@ wss.on('connection', (ws) => {
                     ws.send(out);
                 }
             }
-            if (msg.type === 'delete') {
-                await chatCollection.deleteOne({ _id: new ObjectId(msg.id) });
-                broadcast(JSON.stringify({ type: 'delete', id: msg.id }));
-            }
-            if (msg.type === 'edit') {
-                await chatCollection.updateOne({ _id: new ObjectId(msg.id) }, { $set: { text: msg.text, isEdited: true } });
-                broadcast(JSON.stringify({ type: 'edit', id: msg.id, text: msg.text }));
-            }
         } catch (e) { console.log(e); }
     });
     ws.on('close', () => { if (currentUser) { users.delete(currentUser); broadcastOnlineList(); } });
@@ -65,4 +57,3 @@ wss.on('connection', (ws) => {
 
 function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
 function broadcastOnlineList() { broadcast(JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) })); }
-
