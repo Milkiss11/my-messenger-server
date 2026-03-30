@@ -6,13 +6,11 @@ const client = new MongoClient(uri);
 let chatCollection, accountsCollection;
 
 async function connectDB() {
-    try {
-        await client.connect();
-        const db = client.db("messenger");
-        chatCollection = db.collection("messages");
-        accountsCollection = db.collection("accounts");
-        console.log("✅ Maxim Server: OK");
-    } catch (e) { console.error(e); }
+    await client.connect();
+    const db = client.db("messenger");
+    chatCollection = db.collection("messages");
+    accountsCollection = db.collection("accounts");
+    console.log("✅ MaXiM Server: OK");
 }
 connectDB();
 
@@ -26,9 +24,21 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data.toString());
 
             if (msg.type === 'auth') {
-                currentUser = msg.user;
-                users.set(currentUser, { ws, avatar: msg.avatar || "" });
-                await accountsCollection.updateOne({ tag: msg.tag }, { $set: { user: msg.user, avatar: msg.avatar } }, { upsert: true });
+                const { user, tag } = msg;
+                let account = await accountsCollection.findOne({ tag: tag });
+
+                if (account) {
+                    if (account.user !== user) {
+                        return ws.send(JSON.stringify({ type: 'auth_error', message: 'Тег занят другим ником!' }));
+                    }
+                } else {
+                    const nameCheck = await accountsCollection.findOne({ user: user });
+                    if (nameCheck) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник уже занят!' }));
+                    await accountsCollection.insertOne({ user: user, tag: tag });
+                }
+
+                currentUser = user;
+                users.set(currentUser, { ws });
                 const history = await chatCollection.find({ $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }] }).sort({ timestamp: 1 }).limit(100).toArray();
                 ws.send(JSON.stringify({ type: 'history', data: history }));
                 broadcastOnlineList();
@@ -46,12 +56,10 @@ wss.on('connection', (ws) => {
                     ws.send(out);
                 }
             }
-
             if (msg.type === 'delete') {
                 await chatCollection.deleteOne({ _id: new ObjectId(msg.id) });
                 broadcast(JSON.stringify({ type: 'delete', id: msg.id }));
             }
-
             if (msg.type === 'edit') {
                 await chatCollection.updateOne({ _id: new ObjectId(msg.id) }, { $set: { text: msg.text, isEdited: true } });
                 broadcast(JSON.stringify({ type: 'edit', id: msg.id, text: msg.text }));
