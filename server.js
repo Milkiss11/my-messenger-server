@@ -16,8 +16,6 @@ async function connectDB() {
         await chatCollection.createIndex({ user: 1 });
         await chatCollection.createIndex({ to: 1 });
         await chatCollection.createIndex({ timestamp: 1 });
-        await chatCollection.createIndex({ delivered: 1 });
-        await chatCollection.createIndex({ read: 1 });
         
         console.log("✅ Сервер Nevkini: база подключена");
     } catch (e) { 
@@ -28,12 +26,19 @@ async function connectDB() {
 connectDB();
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const users = new Map();
+const users = new Map(); // user -> { ws, avatar, fcmToken, connectionId }
+
+let connectionCounter = 0;
 
 wss.on('connection', (ws) => {
     let currentUser = null;
+    let connectionId = ++connectionCounter;
     ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
+    ws.connectionId = connectionId;
+    
+    ws.on('pong', () => { 
+        ws.isAlive = true; 
+    });
 
     ws.on('message', async (data) => {
         try {
@@ -41,11 +46,21 @@ wss.on('connection', (ws) => {
             if (raw === 'pong') return;
             
             const msg = JSON.parse(raw);
-            console.log(`📨 Получено: ${msg.type} от ${msg.user || 'unknown'}`);
+            console.log(`📨 [${connectionId}] Получено: ${msg.type} от ${msg.user || 'unknown'}`);
 
             // АВТОРИЗАЦИЯ
             if (msg.type === 'auth') {
-                const { user, tag, avatar } = msg;
+                const { user, tag, avatar, fcmToken } = msg;
+                
+                // Проверяем, не подключен ли уже этот пользователь с другим сокетом
+                const existingConnection = users.get(user);
+                if (existingConnection && existingConnection.ws !== ws) {
+                    console.log(`⚠️ Пользователь ${user} уже подключен, закрываем старое соединение ${existingConnection.connectionId}`);
+                    try {
+                        existingConnection.ws.close(1000, "Новое подключение");
+                    } catch(e) {}
+                    users.delete(user);
+                }
                 
                 let account = await accountsCollection.findOne({ tag: tag });
                 
@@ -65,12 +80,15 @@ wss.on('connection', (ws) => {
                         
                         await accountsCollection.updateOne(
                             { tag: tag },
-                            { $set: { user: newNick, avatar: avatar || account.avatar, lastSeen: new Date() } }
+                            { $set: { 
+                                user: newNick, 
+                                avatar: avatar || account.avatar, 
+                                lastSeen: new Date(),
+                                fcmToken: fcmToken || account.fcmToken
+                            } }
                         );
                         
-                        if (users.has(oldNick)) {
-                            const oldWs = users.get(oldNick).ws;
-                            if (oldWs !== ws) oldWs.close();
+                        if (users.has(oldNick) && users.get(oldNick).ws !== ws) {
                             users.delete(oldNick);
                         }
                         
@@ -78,7 +96,11 @@ wss.on('connection', (ws) => {
                     } else {
                         await accountsCollection.updateOne(
                             { tag: tag },
-                            { $set: { avatar: avatar || account.avatar, lastSeen: new Date() } }
+                            { $set: { 
+                                avatar: avatar || account.avatar, 
+                                lastSeen: new Date(),
+                                fcmToken: fcmToken || account.fcmToken
+                            } }
                         );
                         currentUser = user;
                     }
@@ -87,13 +109,20 @@ wss.on('connection', (ws) => {
                         user: user, 
                         tag: tag, 
                         avatar: avatar || "",
+                        fcmToken: fcmToken || null,
                         lastSeen: new Date(),
                         createdAt: new Date()
                     });
                     currentUser = user;
                 }
                 
-                users.set(currentUser, { ws, avatar: avatar || "", lastSeen: new Date() });
+                // Сохраняем подключение
+                users.set(currentUser, { 
+                    ws, 
+                    avatar: avatar || "", 
+                    fcmToken,
+                    connectionId: connectionId
+                });
                 
                 // Загружаем историю
                 const history = await chatCollection.find({
@@ -104,7 +133,9 @@ wss.on('connection', (ws) => {
                     ]
                 }).sort({ timestamp: 1 }).toArray();
                 
-                ws.send(JSON.stringify({ type: 'history', data: history }));
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'history', data: history }));
+                }
                 
                 // Отправляем список пользователей
                 await sendUserList(ws);
@@ -116,7 +147,7 @@ wss.on('connection', (ws) => {
                     type: 'private'
                 }).toArray();
                 
-                if (undelivered.length > 0) {
+                if (undelivered.length > 0 && ws.readyState === 1) {
                     console.log(`📦 Отправка ${undelivered.length} офлайн сообщений для ${currentUser}`);
                     for (const msg of undelivered) {
                         ws.send(JSON.stringify({ ...msg, _id: msg._id.toString() }));
@@ -128,11 +159,21 @@ wss.on('connection', (ws) => {
                 }
                 
                 broadcastOnlineList();
-                console.log(`✅ ${currentUser} авторизован. Онлайн: ${users.size}`);
+                console.log(`✅ [${connectionId}] ${currentUser} авторизован. Онлайн: ${users.size}`);
                 return;
             }
 
-            if (!currentUser) return;
+            if (!currentUser) {
+                console.log(`⚠️ Сообщение от неавторизованного соединения ${connectionId}`);
+                return;
+            }
+
+            // Проверяем, что это актуальное соединение
+            const userData = users.get(currentUser);
+            if (userData && userData.connectionId !== connectionId) {
+                console.log(`⚠️ Устаревшее сообщение от ${currentUser}, игнорируем`);
+                return;
+            }
 
             // ОТПРАВКА СООБЩЕНИЯ
             if (msg.type === 'group' || msg.type === 'private') {
@@ -162,66 +203,40 @@ wss.on('connection', (ws) => {
                 const outMsg = JSON.stringify({ ...doc, _id: result.insertedId.toString() });
                 
                 if (msg.type === 'group') {
-                    broadcast(outMsg);
-                    console.log(`📢 Групповое сообщение от ${currentUser}`);
-                } else {
-                    const targetUser = users.get(msg.to);
-                    if (targetUser) {
-                        targetUser.ws.send(outMsg);
+                    // Рассылаем всем, проверяя готовность соединения
+                    let sentCount = 0;
+                    for (const [user, data] of users) {
+                        if (data.ws.readyState === 1) {
+                            data.ws.send(outMsg);
+                            sentCount++;
+                        }
+                    }
+                    console.log(`📢 Групповое сообщение от ${currentUser} (отправлено ${sentCount} получателям)`);
+                    
+                    // Отправляем отправителю
+                    if (ws.readyState === 1) {
                         ws.send(outMsg);
+                    }
+                } else {
+                    // Приватное сообщение
+                    const targetUser = users.get(msg.to);
+                    
+                    if (targetUser && targetUser.ws.readyState === 1) {
+                        targetUser.ws.send(outMsg);
+                        if (ws.readyState === 1) ws.send(outMsg);
                         await chatCollection.updateOne(
                             { _id: result.insertedId },
                             { $set: { delivered: true } }
                         );
                         console.log(`🔒 Приватное сообщение от ${currentUser} к ${msg.to} (доставлено онлайн)`);
                     } else {
-                        ws.send(outMsg);
+                        if (ws.readyState === 1) ws.send(outMsg);
                         console.log(`💾 Приватное сообщение от ${currentUser} к ${msg.to} (сохранено офлайн)`);
                     }
                 }
             }
             
-            // ПОЛУЧЕНИЕ ОФЛАЙН СООБЩЕНИЙ
-            else if (msg.type === 'get_offline') {
-                const offlineMessages = await chatCollection.find({
-                    to: currentUser,
-                    delivered: { $ne: true },
-                    type: 'private'
-                }).toArray();
-                
-                for (const msg of offlineMessages) {
-                    ws.send(JSON.stringify({ ...msg, _id: msg._id.toString() }));
-                    await chatCollection.updateOne(
-                        { _id: msg._id },
-                        { $set: { delivered: true } }
-                    );
-                }
-                console.log(`📦 Отправлено ${offlineMessages.length} офлайн сообщений для ${currentUser}`);
-            }
-            
-            // УДАЛЕНИЕ
-            else if (msg.type === 'delete') {
-                const result = await chatCollection.deleteOne({ 
-                    _id: new ObjectId(msg.id), 
-                    user: currentUser 
-                });
-                if (result.deletedCount > 0) {
-                    broadcast(JSON.stringify({ type: 'delete_confirm', id: msg.id }));
-                }
-            }
-            
-            // РЕДАКТИРОВАНИЕ
-            else if (msg.type === 'edit') {
-                const result = await chatCollection.updateOne(
-                    { _id: new ObjectId(msg.id), user: currentUser },
-                    { $set: { text: msg.text, isEdited: true } }
-                );
-                if (result.modifiedCount > 0) {
-                    broadcast(JSON.stringify({ type: 'update', id: msg.id, text: msg.text }));
-                }
-            }
-            
-            // ПЕЧАТАНИЕ - ИСПРАВЛЕНО
+            // ПЕЧАТАНИЕ
             else if (msg.type === 'typing') {
                 if (msg.chatType === 'private' && msg.to && msg.to !== 'all') {
                     const target = users.get(msg.to);
@@ -238,12 +253,48 @@ wss.on('connection', (ws) => {
                         user: currentUser,
                         chatType: 'group'
                     });
-                    wss.clients.forEach(client => {
-                        if (client !== ws && client.readyState === 1) {
-                            client.send(typingMsg);
+                    for (const [user, data] of users) {
+                        if (user !== currentUser && data.ws.readyState === 1) {
+                            data.ws.send(typingMsg);
                         }
-                    });
+                    }
                 }
+            }
+            
+            // УДАЛЕНИЕ
+            else if (msg.type === 'delete') {
+                try {
+                    const result = await chatCollection.deleteOne({ 
+                        _id: new ObjectId(msg.id), 
+                        user: currentUser 
+                    });
+                    if (result.deletedCount > 0) {
+                        const deleteMsg = JSON.stringify({ type: 'delete_confirm', id: msg.id });
+                        for (const [user, data] of users) {
+                            if (data.ws.readyState === 1) {
+                                data.ws.send(deleteMsg);
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+            
+            // РЕДАКТИРОВАНИЕ
+            else if (msg.type === 'edit') {
+                try {
+                    const result = await chatCollection.updateOne(
+                        { _id: new ObjectId(msg.id), user: currentUser },
+                        { $set: { text: msg.text, isEdited: true } }
+                    );
+                    if (result.modifiedCount > 0) {
+                        const editMsg = JSON.stringify({ type: 'update', id: msg.id, text: msg.text });
+                        for (const [user, data] of users) {
+                            if (data.ws.readyState === 1) {
+                                data.ws.send(editMsg);
+                            }
+                        }
+                    }
+                } catch(e) {}
             }
             
             // ОТМЕТКА О ПРОЧТЕНИИ
@@ -259,7 +310,7 @@ wss.on('connection', (ws) => {
                 );
                 
                 const target = users.get(msg.target);
-                if (target) {
+                if (target && target.ws.readyState === 1) {
                     target.ws.send(JSON.stringify({ type: 'messages_read', by: currentUser }));
                 }
             }
@@ -269,57 +320,90 @@ wss.on('connection', (ws) => {
         }
     });
     
-    ws.on('close', async () => { 
-        if (currentUser) { 
-            await accountsCollection.updateOne(
-                { user: currentUser },
-                { $set: { lastSeen: new Date() } }
-            );
-            users.delete(currentUser); 
-            broadcastOnlineList();
-            console.log(`❌ ${currentUser} отключился. Онлайн: ${users.size}`);
+    ws.on('close', async (code, reason) => {
+        console.log(`🔌 [${connectionId}] Соединение закрыто. Код: ${code}, Причина: ${reason || 'нет'}`);
+        
+        if (currentUser) {
+            // Проверяем, что это именно то соединение, которое в мапе
+            const userData = users.get(currentUser);
+            if (userData && userData.connectionId === connectionId) {
+                // Обновляем время последнего визита
+                try {
+                    await accountsCollection.updateOne(
+                        { user: currentUser },
+                        { $set: { lastSeen: new Date() } }
+                    );
+                } catch(e) {}
+                
+                users.delete(currentUser);
+                broadcastOnlineList();
+                console.log(`❌ ${currentUser} отключился. Онлайн: ${users.size}`);
+            } else {
+                console.log(`⚠️ Устаревшее закрытие соединения для ${currentUser}, игнорируем`);
+            }
         }
+    });
+    
+    ws.on('error', (error) => {
+        console.error(`❌ [${connectionId}] WebSocket ошибка:`, error.message);
     });
 });
 
 async function sendUserList(ws) {
-    const allUsers = await accountsCollection.find({}).toArray();
-    const userList = allUsers.map(user => ({
-        user: user.user,
-        avatar: user.avatar,
-        isOnline: users.has(user.user),
-        lastSeen: user.lastSeen
-    }));
-    ws.send(JSON.stringify({ type: 'user_list', users: userList }));
-}
-
-function broadcast(data) {
-    wss.clients.forEach(client => {
-        if (client.readyState === 1) {
-            client.send(data);
+    try {
+        const allUsers = await accountsCollection.find({}).toArray();
+        const userList = allUsers.map(user => ({
+            user: user.user,
+            avatar: user.avatar || "",
+            isOnline: users.has(user.user),
+            lastSeen: user.lastSeen
+        }));
+        if (ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'user_list', users: userList }));
         }
-    });
+    } catch(e) {
+        console.error("Ошибка отправки списка пользователей:", e);
+    }
 }
 
 async function broadcastOnlineList() {
-    const allUsers = await accountsCollection.find({}).toArray();
-    const userList = allUsers.map(user => ({
-        user: user.user,
-        avatar: user.avatar,
-        isOnline: users.has(user.user),
-        lastSeen: user.lastSeen
-    }));
-    broadcast(JSON.stringify({ type: 'user_list', users: userList }));
+    try {
+        const allUsers = await accountsCollection.find({}).toArray();
+        const userList = allUsers.map(user => ({
+            user: user.user,
+            avatar: user.avatar || "",
+            isOnline: users.has(user.user),
+            lastSeen: user.lastSeen
+        }));
+        const message = JSON.stringify({ type: 'user_list', users: userList });
+        
+        for (const [user, data] of users) {
+            if (data.ws.readyState === 1) {
+                data.ws.send(message);
+            }
+        }
+    } catch(e) {
+        console.error("Ошибка рассылки списка пользователей:", e);
+    }
 }
 
+// Пинг для поддержания соединения
 const interval = setInterval(() => {
-    wss.clients.forEach(ws => {
-        if (!ws.isAlive) {
-            return ws.terminate();
+    for (const [user, data] of users) {
+        if (!data.ws.isAlive) {
+            console.log(`💀 ${user} не отвечает на пинг, закрываем соединение`);
+            try {
+                data.ws.terminate();
+            } catch(e) {}
+            users.delete(user);
+            broadcastOnlineList();
+        } else {
+            data.ws.isAlive = false;
+            try {
+                data.ws.ping();
+            } catch(e) {}
         }
-        ws.isAlive = false;
-        ws.ping();
-    });
+    }
 }, 30000);
 
 wss.on('close', () => {
