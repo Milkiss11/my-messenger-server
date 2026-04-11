@@ -11,6 +11,13 @@ async function connectDB() {
         const db = client.db("messenger");
         chatCollection = db.collection("messages");
         accountsCollection = db.collection("accounts");
+        
+        // Создаем индексы для быстрого поиска
+        await chatCollection.createIndex({ user: 1 });
+        await chatCollection.createIndex({ to: 1 });
+        await chatCollection.createIndex({ timestamp: 1 });
+        await chatCollection.createIndex({ type: 1 });
+        
         console.log("✅ Сервер Nevkini: база подключена");
     } catch (e) { 
         console.error("❌ Ошибка базы:", e);
@@ -20,7 +27,7 @@ async function connectDB() {
 connectDB();
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const users = new Map();
+const users = new Map(); // user -> { ws, avatar, nick }
 
 wss.on('connection', (ws) => {
     let currentUser = null;
@@ -33,48 +40,77 @@ wss.on('connection', (ws) => {
             if (raw === 'pong') return;
             
             const msg = JSON.parse(raw);
-            console.log(`Получено: ${msg.type} от ${msg.user || 'unknown'}`);
+            console.log(`📨 Получено: ${msg.type} от ${msg.user || 'unknown'}`);
 
+            // АВТОРИЗАЦИЯ
             if (msg.type === 'auth') {
                 const { user, tag, avatar } = msg;
                 
-                // Ищем аккаунт по тегу
+                // Проверяем или создаем аккаунт
                 let account = await accountsCollection.findOne({ tag: tag });
                 
                 if (account) {
-                    // Обновляем существующий аккаунт
-                    await accountsCollection.updateOne(
-                        { tag: tag }, 
-                        { $set: { user: user, avatar: avatar, lastSeen: new Date() } }
-                    );
-                } else {
-                    // Проверяем, не занят ли ник
-                    const nameCheck = await accountsCollection.findOne({ user: user });
-                    if (nameCheck) {
-                        ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник уже занят! Используйте другой тег или ник' }));
-                        return;
+                    // Обновляем существующий аккаунт (возможно ник изменился)
+                    const oldNick = account.user;
+                    const newNick = user;
+                    
+                    if (oldNick !== newNick) {
+                        // Обновляем все сообщения старого пользователя
+                        await chatCollection.updateMany(
+                            { user: oldNick },
+                            { $set: { user: newNick, avatar: avatar || account.avatar } }
+                        );
+                        await chatCollection.updateMany(
+                            { to: oldNick },
+                            { $set: { to: newNick } }
+                        );
+                        
+                        // Обновляем аккаунт
+                        await accountsCollection.updateOne(
+                            { tag: tag },
+                            { $set: { user: newNick, avatar: avatar || account.avatar, lastSeen: new Date() } }
+                        );
+                        
+                        // Удаляем старого пользователя из онлайн списка
+                        if (users.has(oldNick)) {
+                            const oldWs = users.get(oldNick).ws;
+                            if (oldWs !== ws) oldWs.close();
+                            users.delete(oldNick);
+                        }
+                        
+                        currentUser = newNick;
+                    } else {
+                        await accountsCollection.updateOne(
+                            { tag: tag },
+                            { $set: { avatar: avatar || account.avatar, lastSeen: new Date() } }
+                        );
+                        currentUser = user;
                     }
+                } else {
+                    // Новый аккаунт
                     await accountsCollection.insertOne({ 
                         user: user, 
                         tag: tag, 
                         avatar: avatar || "",
                         createdAt: new Date()
                     });
+                    currentUser = user;
                 }
                 
-                currentUser = user;
-                users.set(currentUser, { ws, avatar: avatar || "" });
+                users.set(currentUser, { ws, avatar: avatar || "", nick: currentUser });
                 
-                // Загружаем историю сообщений
+                // Загружаем историю сообщений для этого пользователя
                 const history = await chatCollection.find({
                     $or: [
                         { type: 'group' },
                         { user: currentUser },
                         { to: currentUser }
                     ]
-                }).sort({ timestamp: 1 }).limit(100).toArray();
+                }).sort({ timestamp: 1 }).toArray(); // Убираем limit(100) чтобы загрузить все
                 
                 ws.send(JSON.stringify({ type: 'history', data: history }));
+                console.log(`📜 История для ${currentUser}: ${history.length} сообщений`);
+                
                 broadcastOnlineList();
                 console.log(`✅ ${currentUser} авторизован. Онлайн: ${users.size}`);
                 return;
@@ -82,18 +118,28 @@ wss.on('connection', (ws) => {
 
             if (!currentUser) return;
 
-            // Обработка сообщений
+            // ОТПРАВКА СООБЩЕНИЯ
             if (msg.type === 'group' || msg.type === 'private') {
                 const session = users.get(currentUser);
+                const now = new Date();
+                
                 const doc = { 
-                    ...msg,
+                    type: msg.type,
                     user: currentUser,
+                    to: msg.to || (msg.type === 'group' ? 'Всем' : ''),
+                    text: msg.text,
+                    msgType: msg.msgType || 'text',
                     avatar: session ? session.avatar : "",
-                    time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+                    time: now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
                     timestamp: Date.now(),
+                    date: now.toISOString(),
                     isEdited: false,
                     read: false
                 };
+                
+                if (msg.replyTo) {
+                    doc.replyTo = msg.replyTo;
+                }
                 
                 const result = await chatCollection.insertOne(doc);
                 const outMsg = JSON.stringify({ ...doc, _id: result.insertedId.toString() });
@@ -101,16 +147,21 @@ wss.on('connection', (ws) => {
                 if (msg.type === 'group') {
                     // Рассылаем всем
                     broadcast(outMsg);
+                    console.log(`📢 Групповое сообщение от ${currentUser}`);
                 } else {
                     // Приватное сообщение - отправляем обоим участникам
-                    const target = users.get(msg.to);
-                    if (target) target.ws.send(outMsg);
+                    const targetUser = users.get(msg.to);
+                    if (targetUser) {
+                        targetUser.ws.send(outMsg);
+                        console.log(`🔒 Приватное сообщение от ${currentUser} к ${msg.to} (онлайн)`);
+                    } else {
+                        console.log(`💾 Приватное сообщение от ${currentUser} к ${msg.to} (офлайн, сохранено в БД)`);
+                    }
                     ws.send(outMsg);
                 }
-                console.log(`📨 Сообщение от ${currentUser} в ${msg.type}`);
             }
             
-            // Удаление сообщения
+            // УДАЛЕНИЕ
             else if (msg.type === 'delete') {
                 const result = await chatCollection.deleteOne({ 
                     _id: new ObjectId(msg.id), 
@@ -118,10 +169,11 @@ wss.on('connection', (ws) => {
                 });
                 if (result.deletedCount > 0) {
                     broadcast(JSON.stringify({ type: 'delete_confirm', id: msg.id }));
+                    console.log(`🗑 Удалено сообщение ${msg.id} от ${currentUser}`);
                 }
             }
             
-            // Редактирование
+            // РЕДАКТИРОВАНИЕ
             else if (msg.type === 'edit') {
                 const result = await chatCollection.updateOne(
                     { _id: new ObjectId(msg.id), user: currentUser },
@@ -129,10 +181,11 @@ wss.on('connection', (ws) => {
                 );
                 if (result.modifiedCount > 0) {
                     broadcast(JSON.stringify({ type: 'update', id: msg.id, text: msg.text }));
+                    console.log(`✏ Отредактировано сообщение ${msg.id} от ${currentUser}`);
                 }
             }
             
-            // Статус печатания
+            // ПЕЧАТАНИЕ
             else if (msg.type === 'typing') {
                 if (msg.chatType === 'private' && msg.to) {
                     const target = users.get(msg.to);
@@ -144,9 +197,9 @@ wss.on('connection', (ws) => {
                 }
             }
             
-            // Отметить прочитанными
+            // ОТМЕТКА О ПРОЧТЕНИИ
             else if (msg.type === 'read_all' && msg.target) {
-                await chatCollection.updateMany(
+                const result = await chatCollection.updateMany(
                     { 
                         type: 'private', 
                         user: msg.target, 
@@ -155,6 +208,11 @@ wss.on('connection', (ws) => {
                     },
                     { $set: { read: true } }
                 );
+                
+                if (result.modifiedCount > 0) {
+                    console.log(`👁 Отметил прочитанными ${result.modifiedCount} сообщений от ${msg.target}`);
+                }
+                
                 const target = users.get(msg.target);
                 if (target) {
                     target.ws.send(JSON.stringify({ type: 'messages_read', by: currentUser }));
@@ -162,7 +220,7 @@ wss.on('connection', (ws) => {
             }
             
         } catch (e) {
-            console.error("Ошибка обработки:", e);
+            console.error("❌ Ошибка обработки:", e);
         }
     });
     
