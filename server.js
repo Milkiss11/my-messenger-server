@@ -11,8 +11,11 @@ async function connectDB() {
         const db = client.db("messenger");
         chatCollection = db.collection("messages");
         accountsCollection = db.collection("accounts");
-        console.log("✅ MaXiM Server Connected");
-    } catch (e) { console.error(e); }
+        console.log("✅ Сервер Nevkini: база подключена");
+    } catch (e) { 
+        console.error("❌ Ошибка базы:", e);
+        setTimeout(connectDB, 5000);
+    }
 }
 connectDB();
 
@@ -26,54 +29,181 @@ wss.on('connection', (ws) => {
 
     ws.on('message', async (data) => {
         try {
-            const msg = JSON.parse(data.toString());
+            const raw = data.toString();
+            if (raw === 'pong') return;
+            
+            const msg = JSON.parse(raw);
+            console.log(`Получено: ${msg.type} от ${msg.user || 'unknown'}`);
+
             if (msg.type === 'auth') {
-                const { user, tag } = msg;
+                const { user, tag, avatar } = msg;
+                
+                // Ищем аккаунт по тегу
                 let account = await accountsCollection.findOne({ tag: tag });
+                
                 if (account) {
-                    if (account.user !== user) await accountsCollection.updateOne({ tag: tag }, { $set: { user: user } });
+                    // Обновляем существующий аккаунт
+                    await accountsCollection.updateOne(
+                        { tag: tag }, 
+                        { $set: { user: user, avatar: avatar, lastSeen: new Date() } }
+                    );
                 } else {
+                    // Проверяем, не занят ли ник
                     const nameCheck = await accountsCollection.findOne({ user: user });
-                    if (nameCheck) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник занят!' }));
-                    await accountsCollection.insertOne({ user: user, tag: tag });
+                    if (nameCheck) {
+                        ws.send(JSON.stringify({ type: 'auth_error', message: 'Ник уже занят! Используйте другой тег или ник' }));
+                        return;
+                    }
+                    await accountsCollection.insertOne({ 
+                        user: user, 
+                        tag: tag, 
+                        avatar: avatar || "",
+                        createdAt: new Date()
+                    });
                 }
+                
                 currentUser = user;
-                users.set(currentUser, { ws });
-                const history = await chatCollection.find({ $or: [{ type: 'group' }, { user: currentUser }, { to: currentUser }] }).sort({ timestamp: 1 }).toArray();
+                users.set(currentUser, { ws, avatar: avatar || "" });
+                
+                // Загружаем историю сообщений
+                const history = await chatCollection.find({
+                    $or: [
+                        { type: 'group' },
+                        { user: currentUser },
+                        { to: currentUser }
+                    ]
+                }).sort({ timestamp: 1 }).limit(100).toArray();
+                
                 ws.send(JSON.stringify({ type: 'history', data: history }));
                 broadcastOnlineList();
+                console.log(`✅ ${currentUser} авторизован. Онлайн: ${users.size}`);
                 return;
             }
 
+            if (!currentUser) return;
+
+            // Обработка сообщений
             if (msg.type === 'group' || msg.type === 'private') {
-                const doc = { ...msg, time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }), timestamp: Date.now() };
-                const res = await chatCollection.insertOne(doc);
-                const out = JSON.stringify({ ...doc, _id: res.insertedId.toString() });
-                if (msg.type === 'group') broadcast(out);
-                else {
-                    const t = users.get(msg.to);
-                    if (t) t.ws.send(out);
-                    ws.send(out);
+                const session = users.get(currentUser);
+                const doc = { 
+                    ...msg,
+                    user: currentUser,
+                    avatar: session ? session.avatar : "",
+                    time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+                    timestamp: Date.now(),
+                    isEdited: false,
+                    read: false
+                };
+                
+                const result = await chatCollection.insertOne(doc);
+                const outMsg = JSON.stringify({ ...doc, _id: result.insertedId.toString() });
+                
+                if (msg.type === 'group') {
+                    // Рассылаем всем
+                    broadcast(outMsg);
+                } else {
+                    // Приватное сообщение - отправляем обоим участникам
+                    const target = users.get(msg.to);
+                    if (target) target.ws.send(outMsg);
+                    ws.send(outMsg);
+                }
+                console.log(`📨 Сообщение от ${currentUser} в ${msg.type}`);
+            }
+            
+            // Удаление сообщения
+            else if (msg.type === 'delete') {
+                const result = await chatCollection.deleteOne({ 
+                    _id: new ObjectId(msg.id), 
+                    user: currentUser 
+                });
+                if (result.deletedCount > 0) {
+                    broadcast(JSON.stringify({ type: 'delete_confirm', id: msg.id }));
                 }
             }
-            if (msg.type === 'delete') {
-                await chatCollection.deleteOne({ _id: new ObjectId(msg.id) });
-                broadcast(JSON.stringify({ type: 'delete', id: msg.id }));
+            
+            // Редактирование
+            else if (msg.type === 'edit') {
+                const result = await chatCollection.updateOne(
+                    { _id: new ObjectId(msg.id), user: currentUser },
+                    { $set: { text: msg.text, isEdited: true } }
+                );
+                if (result.modifiedCount > 0) {
+                    broadcast(JSON.stringify({ type: 'update', id: msg.id, text: msg.text }));
+                }
             }
-            if (msg.type === 'edit') {
-                await chatCollection.updateOne({ _id: new ObjectId(msg.id) }, { $set: { text: msg.text, isEdited: true } });
-                broadcast(JSON.stringify({ type: 'edit', id: msg.id, text: msg.text }));
+            
+            // Статус печатания
+            else if (msg.type === 'typing') {
+                if (msg.chatType === 'private' && msg.to) {
+                    const target = users.get(msg.to);
+                    if (target) {
+                        target.ws.send(JSON.stringify({ type: 'typing', user: currentUser }));
+                    }
+                } else if (msg.chatType === 'group') {
+                    broadcast(JSON.stringify({ type: 'typing', user: currentUser }));
+                }
             }
-        } catch (e) { console.log(e); }
+            
+            // Отметить прочитанными
+            else if (msg.type === 'read_all' && msg.target) {
+                await chatCollection.updateMany(
+                    { 
+                        type: 'private', 
+                        user: msg.target, 
+                        to: currentUser, 
+                        read: false 
+                    },
+                    { $set: { read: true } }
+                );
+                const target = users.get(msg.target);
+                if (target) {
+                    target.ws.send(JSON.stringify({ type: 'messages_read', by: currentUser }));
+                }
+            }
+            
+        } catch (e) {
+            console.error("Ошибка обработки:", e);
+        }
     });
-    ws.on('close', () => { if (currentUser) { users.delete(currentUser); broadcastOnlineList(); } });
+    
+    ws.on('close', () => { 
+        if (currentUser) { 
+            users.delete(currentUser); 
+            broadcastOnlineList();
+            console.log(`❌ ${currentUser} отключился. Онлайн: ${users.size}`);
+        }
+    });
 });
 
-function broadcast(data) { wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); }); }
-function broadcastOnlineList() {
-    const list = JSON.stringify({ type: 'online_list', users: Array.from(users.keys()) });
-    broadcast(list);
+function broadcast(data) {
+    wss.clients.forEach(client => {
+        if (client.readyState === 1) {
+            client.send(data);
+        }
+    });
 }
-setInterval(() => {
-    wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); });
+
+function broadcastOnlineList() {
+    const onlineList = JSON.stringify({ 
+        type: 'online_list', 
+        users: Array.from(users.keys()) 
+    });
+    broadcast(onlineList);
+}
+
+// Пинг для поддержания соединения
+const interval = setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) {
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
 }, 30000);
+
+wss.on('close', () => {
+    clearInterval(interval);
+});
+
+console.log(`🚀 Сервер запущен на порту ${process.env.PORT || 8080}`);
