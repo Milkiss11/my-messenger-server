@@ -28,7 +28,7 @@ async function connectDB() {
 connectDB();
 
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
-const users = new Map(); // user -> { ws, avatar, lastSeen }
+const users = new Map();
 
 wss.on('connection', (ws) => {
     let currentUser = null;
@@ -95,7 +95,7 @@ wss.on('connection', (ws) => {
                 
                 users.set(currentUser, { ws, avatar: avatar || "", lastSeen: new Date() });
                 
-                // Загружаем историю (все сообщения, не только 100)
+                // Загружаем историю
                 const history = await chatCollection.find({
                     $or: [
                         { type: 'group' },
@@ -106,7 +106,7 @@ wss.on('connection', (ws) => {
                 
                 ws.send(JSON.stringify({ type: 'history', data: history }));
                 
-                // Отправляем список пользователей с их статусами
+                // Отправляем список пользователей
                 await sendUserList(ws);
                 
                 // Отправляем непрочитанные офлайн сообщения
@@ -165,10 +165,8 @@ wss.on('connection', (ws) => {
                     broadcast(outMsg);
                     console.log(`📢 Групповое сообщение от ${currentUser}`);
                 } else {
-                    // Приватное сообщение
                     const targetUser = users.get(msg.to);
                     if (targetUser) {
-                        // Если пользователь онлайн - отправляем сразу
                         targetUser.ws.send(outMsg);
                         ws.send(outMsg);
                         await chatCollection.updateOne(
@@ -177,7 +175,6 @@ wss.on('connection', (ws) => {
                         );
                         console.log(`🔒 Приватное сообщение от ${currentUser} к ${msg.to} (доставлено онлайн)`);
                     } else {
-                        // Если офлайн - сохраняем в БД, доставим при подключении
                         ws.send(outMsg);
                         console.log(`💾 Приватное сообщение от ${currentUser} к ${msg.to} (сохранено офлайн)`);
                     }
@@ -224,15 +221,28 @@ wss.on('connection', (ws) => {
                 }
             }
             
-            // ПЕЧАТАНИЕ
+            // ПЕЧАТАНИЕ - ИСПРАВЛЕНО
             else if (msg.type === 'typing') {
-                if (msg.chatType === 'private' && msg.to) {
+                if (msg.chatType === 'private' && msg.to && msg.to !== 'all') {
                     const target = users.get(msg.to);
-                    if (target) {
-                        target.ws.send(JSON.stringify({ type: 'typing', user: currentUser }));
+                    if (target && target.ws.readyState === 1) {
+                        target.ws.send(JSON.stringify({ 
+                            type: 'typing', 
+                            user: currentUser,
+                            chatType: 'private'
+                        }));
                     }
                 } else if (msg.chatType === 'group') {
-                    broadcast(JSON.stringify({ type: 'typing', user: currentUser }));
+                    const typingMsg = JSON.stringify({ 
+                        type: 'typing', 
+                        user: currentUser,
+                        chatType: 'group'
+                    });
+                    wss.clients.forEach(client => {
+                        if (client !== ws && client.readyState === 1) {
+                            client.send(typingMsg);
+                        }
+                    });
                 }
             }
             
@@ -261,12 +271,10 @@ wss.on('connection', (ws) => {
     
     ws.on('close', async () => { 
         if (currentUser) { 
-            // Обновляем время последнего визита
             await accountsCollection.updateOne(
                 { user: currentUser },
                 { $set: { lastSeen: new Date() } }
             );
-            
             users.delete(currentUser); 
             broadcastOnlineList();
             console.log(`❌ ${currentUser} отключился. Онлайн: ${users.size}`);
@@ -274,7 +282,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// Отправка списка пользователей с их статусами
 async function sendUserList(ws) {
     const allUsers = await accountsCollection.find({}).toArray();
     const userList = allUsers.map(user => ({
@@ -283,7 +290,6 @@ async function sendUserList(ws) {
         isOnline: users.has(user.user),
         lastSeen: user.lastSeen
     }));
-    
     ws.send(JSON.stringify({ type: 'user_list', users: userList }));
 }
 
@@ -303,12 +309,9 @@ async function broadcastOnlineList() {
         isOnline: users.has(user.user),
         lastSeen: user.lastSeen
     }));
-    
-    const message = JSON.stringify({ type: 'user_list', users: userList });
-    broadcast(message);
+    broadcast(JSON.stringify({ type: 'user_list', users: userList }));
 }
 
-// Пинг для поддержания соединения
 const interval = setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
